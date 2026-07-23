@@ -1,11 +1,11 @@
 # pgtemp
 
-Ephemeral, in-memory Postgres for hermetic tests. Stands up a real TCP endpoint
-speaking the Postgres wire protocol — [PGlite] behind [pg-gateway] — so a real
-driver connects over the wire. No Docker, no daemon, no shared state between
-tests.
+Ephemeral in-memory Postgres for hermetic tests.
 
-Extracted from the test harness in [ding](../ding).
+Run `deno test --parallel` and each `Deno.test` receives an isolated DB.
+
+Implemented using [PGlite](https://pglite.dev) and
+[pg-gateway](https://github.com/supabase-community/pg-gateway).
 
 ## Usage
 
@@ -25,7 +25,8 @@ Deno.test("my query", async () => {
 
 `pgtemp(opts)` returns:
 
-- `sql` — a bundled [postgres.js] client, wired to the instance (`max: 1`).
+- `sql` — a bundled [postgres.js](https://github.com/porsager/postgres) client,
+  wired to the instance (`max: 1`).
 - `url` — the connection string, if you'd rather bring your own driver.
 - `db` — the raw `PGlite` handle (`.exec`, `.query`).
 - `port` — the OS-assigned free port.
@@ -40,18 +41,3 @@ await pgtemp({
   onnotice: (n) => {}, // defaults to swallowing notices
 });
 ```
-
-## Concurrency
-
-PGlite is a **single session**. Multiplexing a connection pool onto it corrupts
-the protocol stream, so the bundled `sql` uses `max: 1`; postgres.js still
-pipelines overlapping queries over that one connection, in order. If you connect
-your own driver via `url`, use a **single connection** (e.g. `max: 1`).
-
-## Requirements
-
-Deno (uses `Deno.listen`). Node support via dnt is a possible future addition.
-
-[PGlite]: https://pglite.dev
-[pg-gateway]: https://github.com/supabase-community/pg-gateway
-[postgres.js]: https://github.com/porsager/postgres

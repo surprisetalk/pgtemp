@@ -29,7 +29,10 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   let gate = Promise.resolve();
   const exec = (data: Uint8Array) => {
     const run = gate.then(() => db.execProtocolRaw(data));
-    gate = run.then(() => {}, () => {});
+    gate = run.then(
+      () => {},
+      () => {},
+    );
     return run;
   };
 

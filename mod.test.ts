@@ -40,11 +40,10 @@ Deno.test("concurrent instances: distinct ports, isolated data", async () => {
 Deno.test("extensions load (citext)", async () => {
   await using pg = await pgtemp({
     extensions: { citext },
-    setup:
-      `create extension if not exists citext; create table u (name citext); insert into u values ('Foo')`,
+    setup: `create extension if not exists citext; create table u (name citext); insert into u values ('Foo')`,
   });
-  const [row] = await pg
-    .sql`select count(*)::int as c from u where name = 'foo'`;
+  const [row] =
+    await pg.sql`select count(*)::int as c from u where name = 'foo'`;
   assertEquals(row.c, 1);
 });
 
@@ -58,9 +57,12 @@ Deno.test("teardown is clean and idempotent", async () => {
   await pg.close();
 });
 
-Deno.test("adversarial: bad setup SQL surfaces an error, not a hang", async () => {
-  await assertRejects(() => pgtemp({ setup: `this is not valid sql` }));
-});
+Deno.test(
+  "adversarial: bad setup SQL surfaces an error, not a hang",
+  async () => {
+    await assertRejects(() => pgtemp({ setup: `this is not valid sql` }));
+  },
+);
 
 Deno.test("adversarial: querying after close fails loudly", async () => {
   const pg = await pgtemp();
@@ -68,15 +70,18 @@ Deno.test("adversarial: querying after close fails loudly", async () => {
   await assertRejects(() => pg.sql`select 1`);
 });
 
-Deno.test("adversarial: overlapping queries don't corrupt (single-connection PGlite)", async () => {
-  await using pg = await pgtemp({ setup: `create table nums (n int)` });
-  await Promise.all(
-    Array.from(
-      { length: 25 },
-      (_, i) => pg.sql`insert into nums values (${i})`,
-    ),
-  );
-  const [row] = await pg
-    .sql`select count(*)::int as c, sum(n)::int as s from nums`;
-  assertEquals([row.c, row.s], [25, 300]);
-});
+Deno.test(
+  "adversarial: overlapping queries don't corrupt (single-connection PGlite)",
+  async () => {
+    await using pg = await pgtemp({ setup: `create table nums (n int)` });
+    await Promise.all(
+      Array.from(
+        { length: 25 },
+        (_, i) => pg.sql`insert into nums values (${i})`,
+      ),
+    );
+    const [row] =
+      await pg.sql`select count(*)::int as c, sum(n)::int as s from nums`;
+    assertEquals([row.c, row.s], [25, 300]);
+  },
+);
