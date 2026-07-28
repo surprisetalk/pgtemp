@@ -31,7 +31,8 @@ import { tsm_system_rows } from "@electric-sql/pglite/contrib/tsm_system_rows";
 import { tsm_system_time } from "@electric-sql/pglite/contrib/tsm_system_time";
 import { unaccent } from "@electric-sql/pglite/contrib/unaccent";
 import { uuid_ossp } from "@electric-sql/pglite/contrib/uuid_ossp";
-import { pgtemp } from "./mod.ts";
+import postgres from "postgres";
+import { pgtemp, type Sql } from "./mod.ts";
 
 Deno.test("happy path: connect and select 1", async () => {
   await using pg = await pgtemp();
@@ -243,6 +244,25 @@ Deno.test("adversarial: a rejected reset leaves the instance usable", async () =
   await assertRejects(() => pg.reset(new Blob(["nonsense"])));
   const [row] = await pg.sql`select n from t`;
   assertEquals(row.n, 5);
+});
+
+// A driver caches prepared statements per connection. If a socket outlives a
+// reset it Binds names the new backend never parsed; postgres.js re-prepares on
+// 26000, but a transaction is already aborted by then, so `begin` is where a
+// surviving connection actually breaks.
+Deno.test("adversarial: a reset drops connections opened against url", async () => {
+  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  const own = postgres(pg.url, { max: 1, onnotice: () => {} });
+  const insert = (sql: Sql | postgres.TransactionSql, v: string) => sql`insert into t (v) values (${v})`;
+  try {
+    await insert(own, "a"); // caches a statement name for this text
+    await pg.reset();
+    await own.begin((tx) => insert(tx, "b")); // same text, so the same cached name
+    const [row] = await own`select count(*)::int as n from t`;
+    assertEquals(row.n, 1); // reset rebuilt from setup, so only 'b' survives
+  } finally {
+    await own.end();
+  }
 });
 
 Deno.test("adversarial: bad setup SQL names the offending statement", async () => {

@@ -159,9 +159,18 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   const port = (server.address() as AddressInfo).port;
   const url = `postgresql://postgres@127.0.0.1:${port}/postgres`;
 
-  const stop = async () => {
+  // A backend swap invalidates every live connection: drivers cache prepared
+  // statements per connection, so a survivor would Bind names the new backend has
+  // never parsed. postgres.js re-prepares on 26000, but inside a transaction the
+  // statement already aborted it — the query dies with `prepared statement "..."
+  // does not exist`. Dropping the sockets forces a reconnect and a fresh cache.
+  const drop = () => {
     for (const socket of sockets) socket.destroy();
     sockets.clear();
+  };
+
+  const stop = async () => {
+    drop();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
 
@@ -172,6 +181,9 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   // PGlite is a single backend; multiplexed wire connections (e.g. a driver's
   // pool) must not interleave raw protocol bytes. Serialize every exec.
   let gate = Promise.resolve();
+  // A connection accepted mid-swap must wait for the new backend rather than read
+  // the closed one out of `db`.
+  let ready: Promise<void>;
 
   const boot = async (snap: Blob | undefined, stmts: string[]) => {
     const next = new PGlite({
@@ -214,7 +226,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   };
 
   try {
-    await boot(opts.snapshot, setup);
+    await (ready = boot(opts.snapshot, setup));
   } catch (e) {
     await stop();
     throw e;
@@ -232,6 +244,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   server.on("connection", async (socket) => {
     await fromNodeSocket(socket, {
       async onStartup() {
+        await ready;
         await db.waitReady;
       },
       async onMessage(
@@ -273,9 +286,10 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       if (closed) throw new Error("pgtemp: reset() after close().");
       if (snap) await assertSnapshot(snap); // validate before tearing anything down
       await sql.end();
+      drop(); // connections opened against `url` do not survive the swap
       await db.close();
       try {
-        await boot(snap ?? opts.snapshot, snap ? [] : setup);
+        await (ready = boot(snap ?? opts.snapshot, snap ? [] : setup));
       } catch (e) {
         // The old backend is already gone. Retire the instance so disposal
         // doesn't double-close it and bury this error under "PGlite is closed".

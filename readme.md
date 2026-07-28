@@ -78,4 +78,5 @@ Two caveats, both from the backend swap:
 
 - Read `pg.sql` and `pg.db` off the object each time. They are getters; a destructured `const { sql } = pg` still points
   at the closed pre-reset client.
-- Connections you opened yourself against `pg.url` are dropped by a reset. Reconnect after it.
+- Connections you opened yourself against `pg.url` are dropped by a reset. They have to be: drivers cache prepared
+  statements per connection, and the new backend has never parsed them. postgres.js reconnects on its own.
