@@ -6,16 +6,11 @@ Run `deno test --parallel` and each `Deno.test` receives an isolated DB.
 
 Implemented using [PGlite](https://pglite.dev) and [pg-gateway](https://github.com/supabase-community/pg-gateway).
 
-Deno only — pgtemp binds to `Deno.listen`.
-
 ## Install
 
 ```sh
 deno add jsr:@surprisetalk/pgtemp
 ```
-
-Tests need `--allow-net --allow-read --allow-env` (net for the listener, read for the PGlite WASM bundle, env for
-postgres.js reading `PG*`).
 
 ## Usage
 
@@ -55,10 +50,6 @@ await pgtemp({
 
 ## Snapshots
 
-A cold boot is ~400ms and your migrations cost whatever they cost. A snapshot is a dump of the data dir, so booting from
-one skips both: **~130ms, regardless of how much schema it contains.** Take it once at module scope and every test
-starts from a fully migrated database.
-
 ```ts
 const snapshot = await (async () => {
   await using pg = await pgtemp({ setup: MIGRATIONS });
@@ -86,15 +77,3 @@ Two caveats, both from the backend swap:
 - Read `pg.sql` and `pg.db` off the object each time. They are getters; a destructured `const { sql } = pg` still points
   at the closed pre-reset client.
 - Connections you opened yourself against `pg.url` are dropped by a reset. Reconnect after it.
-
-Snapshots are uncompressed tarballs (~28MB) held in memory. That is deliberate — gzip cuts them to ~4MB but costs ~500ms
-per snapshot, and these never leave the process.
-
-## Contributing
-
-```sh
-deno task hooks   # once per clone: routes git at .githooks/pre-commit
-deno task test
-```
-
-The hook runs fmt, lint, check, and the test suite — the same four things CI does.

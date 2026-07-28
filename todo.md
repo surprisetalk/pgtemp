@@ -1,4 +1,0 @@
-- [ ] `deno publish` for real (needs JSR auth — user action)
-  - create the `@surprisetalk` scope on jsr.io
-  - create the `pgtemp` package and link it to `github.com/surprisetalk/pgtemp`
-  - then `git tag v0.2.0 && git push --tags` publishes with provenance
