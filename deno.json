@@ -14,5 +14,10 @@
   },
   "publish": {
     "exclude": ["todo.md"]
+  },
+  "fmt": {
+    "lineWidth": 120,
+    "useBraces": "preferNone",
+    "singleBodyPosition": "maintain"
   }
 }

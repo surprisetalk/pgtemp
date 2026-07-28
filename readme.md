@@ -4,8 +4,7 @@ Ephemeral in-memory Postgres for hermetic tests.
 
 Run `deno test --parallel` and each `Deno.test` receives an isolated DB.
 
-Implemented using [PGlite](https://pglite.dev) and
-[pg-gateway](https://github.com/supabase-community/pg-gateway).
+Implemented using [PGlite](https://pglite.dev) and [pg-gateway](https://github.com/supabase-community/pg-gateway).
 
 ## Usage
 
@@ -25,8 +24,7 @@ Deno.test("my query", async () => {
 
 `pgtemp(opts)` returns:
 
-- `sql` — a bundled [postgres.js](https://github.com/porsager/postgres) client,
-  wired to the instance (`max: 1`).
+- `sql` — a bundled [postgres.js](https://github.com/porsager/postgres) client, wired to the instance (`max: 1`).
 - `url` — the connection string, if you'd rather bring your own driver.
 - `db` — the raw `PGlite` handle (`.exec`, `.query`).
 - `port` — the OS-assigned free port.

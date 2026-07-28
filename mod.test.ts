@@ -42,8 +42,8 @@ Deno.test("extensions load (citext)", async () => {
     extensions: { citext },
     setup: `create extension if not exists citext; create table u (name citext); insert into u values ('Foo')`,
   });
-  const [row] =
-    await pg.sql`select count(*)::int as c from u where name = 'foo'`;
+  const [row] = await pg
+    .sql`select count(*)::int as c from u where name = 'foo'`;
   assertEquals(row.c, 1);
 });
 
@@ -80,8 +80,8 @@ Deno.test(
         (_, i) => pg.sql`insert into nums values (${i})`,
       ),
     );
-    const [row] =
-      await pg.sql`select count(*)::int as c, sum(n)::int as s from nums`;
+    const [row] = await pg
+      .sql`select count(*)::int as c, sum(n)::int as s from nums`;
     assertEquals([row.c, row.s], [25, 300]);
   },
 );
