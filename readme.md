@@ -9,7 +9,9 @@ Implemented using [PGlite](https://pglite.dev) and [pg-gateway](https://github.c
 ## Install
 
 ```sh
-deno add jsr:@surprisetalk/pgtemp
+deno add jsr:@surprisetalk/pgtemp   # Deno
+npx jsr add @surprisetalk/pgtemp    # Node
+bunx jsr add @surprisetalk/pgtemp   # Bun
 ```
 
 ## Usage

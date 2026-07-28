@@ -1,6 +1,8 @@
 import { PGlite } from "@electric-sql/pglite";
 import type { Extensions } from "@electric-sql/pglite";
-import { PostgresConnection } from "pg-gateway";
+import { createServer } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
+import { fromNodeSocket } from "pg-gateway/node";
 import postgres from "postgres";
 
 /** The postgres.js client type returned as {@linkcode Pgtemp.sql}. */
@@ -117,8 +119,8 @@ const assertSnapshot = async (snap: Blob) => {
  * Start an ephemeral in-memory Postgres and return once it is accepting queries.
  *
  * Each call gets its own backend on its own OS-assigned port, so
- * `deno test --parallel` gives every test an isolated database. Deno only —
- * this binds to `Deno.listen`.
+ * `deno test --parallel` gives every test an isolated database. Runs on Deno,
+ * Node, and Bun — the listener is `node:net`.
  *
  * @example
  * ```ts
@@ -141,9 +143,27 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   if (opts.snapshot) await assertSnapshot(opts.snapshot);
   const setup = [opts.setup ?? []].flat();
 
-  const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 }); // OS-assigned free port
-  const port = (listener.addr as Deno.NetAddr).port;
+  // node:net rather than Deno.listen so the same file runs on Deno, Node, and
+  // Bun. Sockets are tracked because server.close() only stops new accepts —
+  // it waits on live ones, which would hang teardown.
+  const sockets = new Set<Socket>();
+  const server = createServer();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve); // port 0 — OS-assigned free port
+  });
+  const port = (server.address() as AddressInfo).port;
   const url = `postgresql://postgres@127.0.0.1:${port}/postgres`;
+
+  const stop = async () => {
+    for (const socket of sockets) socket.destroy();
+    sockets.clear();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  };
 
   // reset() swaps the backend; the listener and port survive it, so `url` stays
   // valid and `db`/`sql` are read through getters rather than captured.
@@ -196,7 +216,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   try {
     await boot(opts.snapshot, setup);
   } catch (e) {
-    listener.close();
+    await stop();
     throw e;
   }
 
@@ -209,34 +229,28 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
     return run;
   };
 
-  (async () => {
-    try {
-      for await (const conn of listener) {
-        new PostgresConnection(conn, {
-          async onStartup() {
-            await db.waitReady;
-          },
-          async onMessage(
-            data: Uint8Array,
-            { isAuthenticated }: { isAuthenticated: boolean },
-          ) {
-            if (!isAuthenticated) return;
-            if (data[0] === 88) return; // Terminate
-            return await exec(data);
-          },
-        });
-      }
-    } catch (e) {
-      if (!(e instanceof Deno.errors.BadResource)) throw e; // listener.close() during accept
-    }
-  })();
+  server.on("connection", async (socket) => {
+    await fromNodeSocket(socket, {
+      async onStartup() {
+        await db.waitReady;
+      },
+      async onMessage(
+        data: Uint8Array,
+        { isAuthenticated }: { isAuthenticated: boolean },
+      ) {
+        if (!isAuthenticated) return;
+        if (data[0] === 88) return; // Terminate
+        return await exec(data);
+      },
+    });
+  });
 
   let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;
     await sql.end();
-    listener.close();
+    await stop();
     await db.close();
   };
 
@@ -266,7 +280,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
         // The old backend is already gone. Retire the instance so disposal
         // doesn't double-close it and bury this error under "PGlite is closed".
         closed = true;
-        listener.close();
+        await stop();
         throw e;
       }
     },

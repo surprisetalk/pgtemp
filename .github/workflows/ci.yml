@@ -17,3 +17,22 @@ jobs:
       - run: deno lint
       - run: deno check mod.ts mod.test.ts
       - run: deno task test
+
+  # pgtemp claims Deno, Node, and Bun compatibility on JSR; these keep it honest.
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - run: npm install --no-save @electric-sql/pglite@0.3.15 pg-gateway@0.3.0-beta.4 postgres@3.4.9
+      - run: node --experimental-strip-types smoke.ts
+
+  bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - run: npm install --no-save @electric-sql/pglite@0.3.15 pg-gateway@0.3.0-beta.4 postgres@3.4.9
+      - run: bun smoke.ts
