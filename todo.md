@@ -1,5 +1,6 @@
-- [ ] `deno publish` for real (needs JSR auth — user action)
-- [ ] npm build via dnt for Node consumers
 - [ ] per-test `snapshot`/`reset` helper (template-db semantics)
 - [ ] CI workflow (deno test) + JSR provenance
 - [ ] hstore + more contrib extensions in the smoke test
+- [ ] installation instructions
+- [ ] `deno publish` for real (needs JSR auth — user action)
+- [ ] npm build via dnt for Node consumers
