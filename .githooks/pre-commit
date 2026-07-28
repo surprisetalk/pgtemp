@@ -1,0 +1,8 @@
+#!/bin/sh
+# Same checks as .github/workflows/ci.yml, in the same order: a commit that
+# passes here passes CI. Skip with `git commit --no-verify`.
+set -e
+deno fmt --check || { printf '\n  fix with: deno fmt\n\n'; exit 1; }
+deno lint
+deno check mod.ts mod.test.ts
+deno task test

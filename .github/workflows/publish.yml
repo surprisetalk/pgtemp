@@ -1,0 +1,25 @@
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # JSR provenance via OIDC — no token needed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      # A tag push doesn't trigger ci.yml, so re-run the checks here rather
+      # than publish something unverified.
+      - run: deno fmt --check
+      - run: deno lint
+      - run: deno check mod.ts mod.test.ts
+      - run: deno task test
+      - run: deno publish

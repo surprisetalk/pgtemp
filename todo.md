@@ -1,6 +1,4 @@
-- [ ] per-test `snapshot`/`reset` helper (template-db semantics)
-- [ ] CI workflow (deno test) + JSR provenance
-- [ ] hstore + more contrib extensions in the smoke test
-- [ ] installation instructions
 - [ ] `deno publish` for real (needs JSR auth — user action)
-- [ ] npm build via dnt for Node consumers
+  - create the `@surprisetalk` scope on jsr.io
+  - create the `pgtemp` package and link it to `github.com/surprisetalk/pgtemp`
+  - then `git tag v0.2.0 && git push --tags` publishes with provenance
