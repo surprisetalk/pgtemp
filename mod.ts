@@ -2,6 +2,7 @@ import { PGlite } from "@electric-sql/pglite";
 import type { Extensions } from "@electric-sql/pglite";
 import { createServer } from "node:net";
 import type { AddressInfo, Socket } from "node:net";
+import { BackendError } from "pg-gateway";
 import { fromNodeSocket } from "pg-gateway/node";
 import postgres from "postgres";
 
@@ -51,8 +52,8 @@ export type Pgtemp = {
    * Restore `snap` exactly — data and DDL. With no argument, rebuild what
    * {@linkcode pgtemp} first returned. The listener survives either way, so
    * {@linkcode Pgtemp.url} and {@linkcode Pgtemp.port} stay valid, and so do
-   * connections you opened yourself: their prepared statements are replayed into
-   * the new backend. Other session state (an open transaction, a `SET`) is lost.
+   * connections you opened yourself. Session state (an open transaction, a
+   * `SET`) is lost.
    */
   reset: (snap?: Blob) => Promise<void>;
   /** Close the driver, listener, and backend. Idempotent. */
@@ -116,6 +117,36 @@ const assertSnapshot = async (snap: Blob) => {
   );
 };
 
+// A named prepared statement lives in the backend session, and reset() throws the
+// whole session away — so every name a client cached would Bind against a backend
+// that never Parsed it, failing with 26000, fatally so inside a transaction the
+// driver cannot re-prepare its way out of. Rather than mirror the session's
+// statement table out here and replay it on every swap, named statements are
+// refused at the door. The bundled client sets `prepare: false`; anything else on
+// the wire is told to.
+const refuseNamed = (data: Uint8Array) => {
+  // pg-gateway delivers exactly one framed message per call, so this needs no
+  // buffering: 'P' is Parse, and its statement name is the first cstring.
+  if (data[0] !== 0x50) return;
+  if (data[5] === 0) return; // the unnamed statement never outlives its own Bind
+  const name = new TextDecoder().decode(data.subarray(5, data.indexOf(0, 5)));
+  // FATAL, and thrown rather than returned, so pg-gateway writes the frame and
+  // drops the connection. Answering in-band and staying up is worse: postgres.js
+  // fetches its array types on connect and never runs the query it was opened for
+  // if that fetch fails, so a live connection would hang instead of reject.
+  //
+  // The fix goes in `message` because that is the field that gets printed. hint
+  // and detail are for drivers that surface them.
+  throw BackendError.create({
+    severity: "FATAL",
+    code: "0A000",
+    message:
+      `pgtemp: prepared statements are not supported (Parse "${name}"). Set prepare: false on your driver — postgres(url, { prepare: false }).`,
+    detail: "pgtemp is one Postgres session, and reset() replaces it, so a statement name cannot survive.",
+    hint: "pg.sql already sets it. node-postgres only names a statement when you pass { name } to query().",
+  });
+};
+
 /**
  * Start an ephemeral in-memory Postgres and return once it is accepting queries.
  *
@@ -159,48 +190,6 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   });
   const port = (server.address() as AddressInfo).port;
   const url = `postgresql://postgres@127.0.0.1:${port}/postgres`;
-
-  // A backend swap wipes the session's prepared statements, but the drivers on the
-  // other side of the wire still have their names cached, and Bind against a name
-  // the new backend never parsed fails with 26000 — fatally so inside a
-  // transaction, which the driver cannot re-prepare its way out of.
-  //
-  // Closing those connections instead is worse. The driver only learns a socket is
-  // gone from an event, so a query issued before that event lands is written into a
-  // dead socket: `read ECONNRESET`, or `write CONNECTION_CLOSED` on Deno's node
-  // polyfill. Announcing 57P01 in-band first does not help either — postgres.js
-  // reports a FATAL to the caller rather than swallowing it and reconnecting.
-  //
-  // So the connections stay, and their statements come along: every Parse is kept
-  // and replayed into the new backend, which makes a swap invisible from the wire.
-  // Statements live in the session, and PGlite is one session, so replaying the
-  // union of what live connections parsed restores exactly what they expect. They
-  // are held per socket and discarded with it, so resets cannot pile them up.
-  const parsed = new WeakMap<Socket, Map<string, Uint8Array>>();
-  const SYNC = new Uint8Array([0x53, 0, 0, 0, 4]);
-
-  const remember = (socket: Socket, data: Uint8Array) => {
-    // pg-gateway delivers exactly one framed message per call, so this needs no
-    // buffering: 'P' is Parse, and its statement name is the first cstring.
-    if (data[0] !== 0x50) return;
-    const end = data.indexOf(0, 5);
-    const name = new TextDecoder().decode(data.subarray(5, end));
-    if (!name) return; // the unnamed statement never outlives its own Bind
-    const forSocket = parsed.get(socket) ?? new Map<string, Uint8Array>();
-    forSocket.set(name, data.slice());
-    parsed.set(socket, forSocket);
-  };
-
-  const replay = async (into: PGlite) => {
-    for (const socket of sockets) {
-      for (const msg of parsed.get(socket)?.values() ?? []) {
-        const batch = new Uint8Array(msg.length + SYNC.length);
-        batch.set(msg);
-        batch.set(SYNC, msg.length);
-        await into.execProtocolRaw(batch);
-      }
-    }
-  };
 
   const stop = async () => {
     for (const socket of sockets) socket.destroy();
@@ -247,7 +236,6 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       await next.close().catch(() => {});
       throw e;
     }
-    await replay(next);
     db = next;
     gate = Promise.resolve();
     sql = postgres(url, {
@@ -255,6 +243,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       // statement/portal/transaction namespace coherent. postgres.js still
       // pipelines overlapping queries over that one connection, in order.
       max: 1,
+      prepare: false, // see refuseNamed
       fetch_types: true,
       onnotice: opts.onnotice ?? (() => {}),
     });
@@ -294,7 +283,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       ) {
         if (!isAuthenticated) return;
         if (data[0] === 88) return; // Terminate
-        remember(socket, data);
+        refuseNamed(data);
         return await exec(data);
       },
     });

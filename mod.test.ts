@@ -246,18 +246,17 @@ Deno.test("adversarial: a rejected reset leaves the instance usable", async () =
   assertEquals(row.n, 5);
 });
 
-// A driver caches prepared statements per connection. If the swap did not replay
-// them, this Binds a name the new backend never parsed; postgres.js re-prepares on
-// 26000, but a transaction is already aborted by then, so `begin` is where a
-// surviving connection would break.
+// The socket outlives the backend swap, so the connection has to keep working
+// across it. The transaction matters: outside one, postgres.js papers over a
+// broken session by reconnecting, and the assertion would hold either way.
 Deno.test("a connection opened against url survives a reset", async () => {
   await using pg = await pgtemp({ setup: `create table t (v text)` });
-  const own = postgres(pg.url, { max: 1, onnotice: () => {} });
+  const own = postgres(pg.url, { max: 1, prepare: false, onnotice: () => {} });
   const insert = (sql: Sql | postgres.TransactionSql, v: string) => sql`insert into t (v) values (${v})`;
   try {
-    await insert(own, "a"); // caches a statement name for this text
+    await insert(own, "a");
     await pg.reset();
-    await own.begin((tx) => insert(tx, "b")); // same text, so the same cached name
+    await own.begin((tx) => insert(tx, "b"));
     const [row] = await own`select count(*)::int as n from t`;
     assertEquals(row.n, 1); // reset rebuilt from setup, so only 'b' survives
   } finally {
@@ -265,13 +264,13 @@ Deno.test("a connection opened against url survives a reset", async () => {
   }
 });
 
-// Closing the sockets instead of replaying their statements looked like a fix and
-// was not: the driver only hears about a dead socket from an event, so a query
+// Closing the sockets on every swap instead of letting them ride looked like a fix
+// and was not: the driver only hears about a dead socket from an event, so a query
 // issued first lands on it as `read ECONNRESET` / `write CONNECTION_CLOSED`. One
 // reset rarely catches it — a suite's worth does.
 Deno.test("adversarial: many resets under a long-lived pool", async () => {
   await using pg = await pgtemp({ setup: `create table t (v text)` });
-  const own = postgres(pg.url, { max: 1, onnotice: () => {} });
+  const own = postgres(pg.url, { max: 1, prepare: false, onnotice: () => {} });
   try {
     for (let i = 0; i < 60; i++) {
       await pg.reset();
@@ -288,37 +287,61 @@ Deno.test("adversarial: many resets under a long-lived pool", async () => {
   }
 });
 
-// Every statement a live connection parsed has to come back, not just the most
-// recent one, and a reset must not resurrect statements from a connection that is
-// already gone. The replayed statements are re-bound inside a transaction on
-// purpose: outside one, postgres.js quietly re-prepares on 26000 and the assertion
-// would hold whether or not anything was replayed.
-Deno.test("a reset replays every cached statement, and only for live connections", async () => {
-  await using pg = await pgtemp({ setup: `create table t (a int, b text)` });
-  const own = postgres(pg.url, { max: 1, onnotice: () => {} });
-  const gone = postgres(pg.url, { max: 1, onnotice: () => {} });
+// postgres.js drops the promise for its own fetch_types query, so the refusal below
+// also lands as a dangling rejection — with the same message, which is the point.
+// Deno fails the whole file on one of those, so it is swallowed here by message.
+globalThis.addEventListener("unhandledrejection", (e) => {
+  if (String((e.reason as Error)?.message).includes("prepared statements are not supported")) e.preventDefault();
+});
+
+// `prepare: false` is the contract, so the wire enforces it rather than trusting
+// it: a name outlives the backend that parsed it, and reset() would leave the
+// driver binding into a session that never saw the Parse. Failing at the Parse
+// puts the fix where the mistake is, not three resets downstream. A stock
+// postgres.js client — prepare on, as most people have it — must reject, not hang.
+Deno.test("adversarial: a named prepared statement is refused, with the fix in the error", async () => {
+  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  const own = postgres(pg.url, { max: 1, onnotice: () => {} }); // prepare defaults on
   try {
-    await gone`insert into t (a, b) values (${1}, ${"gone"})`;
-    await gone.end(); // its statements must not be replayed after this
-    // three distinct query texts, so three distinct cached statement names
-    await own`insert into t (a, b) values (${1}, ${"x"})`;
-    await own`select a from t where a = ${1}`;
-    await own`update t set b = ${"y"} where a = ${1}`;
-    await pg.reset();
-    await own.begin(async (tx) => {
-      // each one Binds its pre-reset name against the new backend
-      await tx`insert into t (a, b) values (${2}, ${"x"})`;
-      const rows = await tx`select a from t where a = ${2}`;
-      assertEquals(rows.length, 1);
-      await tx`update t set b = ${"z"} where a = ${2}`;
-    });
-    const [row] = await own`select b from t where a = ${2}`;
-    assertEquals(row.b, "z");
-    const [count] = await own`select count(*)::int as n from t`;
-    assertEquals(count.n, 1); // the reset cleared 'gone' and 'x' alike
+    const e = await assertRejects(() => own`insert into t (v) values (${"a"})`) as postgres.PostgresError;
+    assertStringIncludes(e.message, "prepared statements are not supported");
+    assertStringIncludes(e.message, "prepare: false");
   } finally {
     await own.end();
   }
+  // one bad client does not take the instance with it
+  const [row] = await pg.sql`select count(*)::int as n from t`;
+  assertEquals(row.n, 0);
+});
+
+// The check reads the Parse *name*, not the SQL, so server-side PREPARE is not
+// its business — it is ordinary SQL in an unnamed statement. It is session state
+// like any other, so a reset takes it.
+Deno.test("server-side PREPARE is untouched, and does not survive a reset", async () => {
+  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await pg.sql`prepare ins (text) as insert into t (v) values ($1)`.simple();
+  await pg.sql`execute ins ('a')`.simple();
+  assertEquals((await pg.sql`select v from t`)[0].v, "a");
+  await pg.reset();
+  const e = await assertRejects(() => pg.sql`execute ins ('b')`.simple()) as postgres.PostgresError;
+  assertEquals(e.code, "26000");
+});
+
+// The unnamed statement is how `prepare: false` talks, and it must stay allowed:
+// same Parse message code, empty name.
+Deno.test("the bundled client never names a statement, across a reset", async () => {
+  await using pg = await pgtemp({ setup: `create table t (a int, b text)` });
+  await pg.sql`insert into t (a, b) values (${1}, ${"x"})`;
+  await pg.reset();
+  await pg.sql.begin(async (tx) => {
+    await tx`insert into t (a, b) values (${2}, ${"x"})`;
+    assertEquals((await tx`select a from t where a = ${2}`).length, 1);
+    await tx`update t set b = ${"z"} where a = ${2}`;
+  });
+  const [row] = await pg.sql`select b from t where a = ${2}`;
+  assertEquals(row.b, "z");
+  const [count] = await pg.sql`select count(*)::int as n from t`;
+  assertEquals(count.n, 1); // the reset cleared the pre-reset row
 });
 
 Deno.test("adversarial: bad setup SQL names the offending statement", async () => {

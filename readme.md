@@ -32,7 +32,8 @@ Deno.test("my query", async () => {
 
 `pgtemp(opts)` returns:
 
-- `sql` — a bundled [postgres.js](https://github.com/porsager/postgres) client, wired to the instance (`max: 1`).
+- `sql` — a bundled [postgres.js](https://github.com/porsager/postgres) client, wired to the instance (`max: 1`,
+  `prepare: false`).
 - `url` — the connection string, if you'd rather bring your own driver.
 - `db` — the raw `PGlite` handle (`.exec`, `.query`).
 - `port` — the OS-assigned free port.
@@ -74,12 +75,8 @@ await pg.reset(snap); // restore that snapshot exactly — data and DDL
 await pg.reset(); // rebuild what pgtemp() first returned: opts.snapshot + opts.setup
 ```
 
-One caveat, from the backend swap:
+Two caveats, from the backend swap:
 
 - Read `pg.sql` and `pg.db` off the object each time. They are getters; a destructured `const { sql } = pg` still points
   at the closed pre-reset client.
-
-Connections you opened yourself against `pg.url` survive a reset and need no special handling. A swap does wipe the
-session's prepared statements, so every `Parse` is remembered and replayed into the new backend — your driver's cached
-statement names keep working, and you do not have to reconnect or set `prepare: false`. Session state that is not a
-prepared statement (an open transaction, a `SET`) does not survive; do not reset mid-transaction.
+- Session state does not survive a reset, so don't reset mid-transaction.
