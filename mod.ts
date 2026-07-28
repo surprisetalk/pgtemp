@@ -3,20 +3,56 @@ import type { Extensions } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import postgres from "postgres";
 
+/** The postgres.js client type returned as {@linkcode Pgtemp.sql}. */
+export type Sql = ReturnType<typeof postgres>;
+
+/** Options for {@linkcode pgtemp}. */
 export type PgtempOpts = {
+  /**
+   * PGlite contrib extensions to compile in, keyed by name. Loading an
+   * extension does not install it — run `create extension` in {@linkcode
+   * PgtempOpts.setup} as well.
+   */
   extensions?: Extensions;
+  /** SQL run once, before the instance is returned. */
   setup?: string | string[];
+  /**
+   * A snapshot from {@linkcode Pgtemp.snapshot} to boot from, instead of a cold
+   * start. Roughly 3x faster, and independent of how much schema it holds.
+   * {@linkcode PgtempOpts.setup} still runs afterwards, so a shared base
+   * composes with per-instance extras.
+   */
   snapshot?: Blob;
+  /** Called for every Postgres notice. Defaults to swallowing them. */
   onnotice?: (notice: unknown) => void;
 };
 
+/** A running Postgres instance. Dispose it with `await using`, or {@linkcode Pgtemp.close}. */
 export type Pgtemp = {
+  /** Connection string, for drivers other than the bundled {@linkcode Pgtemp.sql}. */
   url: string;
+  /** The OS-assigned free port this instance listens on. */
   port: number;
+  /**
+   * The raw PGlite backend. Read it off the object each time: it is a getter,
+   * and {@linkcode Pgtemp.reset} replaces the instance behind it.
+   */
   db: PGlite;
-  sql: ReturnType<typeof postgres>;
+  /**
+   * A postgres.js client wired to this instance (`max: 1`). Read it off the
+   * object each time — like {@linkcode Pgtemp.db}, a reset replaces it.
+   */
+  sql: Sql;
+  /** Dump the data dir as an uncompressed tarball, for {@linkcode Pgtemp.reset} or {@linkcode PgtempOpts.snapshot}. */
   snapshot: () => Promise<Blob>;
+  /**
+   * Restore `snap` exactly — data and DDL. With no argument, rebuild what
+   * {@linkcode pgtemp} first returned. The listener survives either way, so
+   * {@linkcode Pgtemp.url} and {@linkcode Pgtemp.port} stay valid, but
+   * connections you opened yourself are dropped.
+   */
   reset: (snap?: Blob) => Promise<void>;
+  /** Close the driver, listener, and backend. Idempotent. */
   close: () => Promise<void>;
   [Symbol.asyncDispose]: () => Promise<void>;
 };
@@ -77,6 +113,30 @@ const assertSnapshot = async (snap: Blob) => {
   );
 };
 
+/**
+ * Start an ephemeral in-memory Postgres and return once it is accepting queries.
+ *
+ * Each call gets its own backend on its own OS-assigned port, so
+ * `deno test --parallel` gives every test an isolated database. Deno only —
+ * this binds to `Deno.listen`.
+ *
+ * @example
+ * ```ts
+ * import { pgtemp } from "@surprisetalk/pgtemp";
+ *
+ * Deno.test("my query", async () => {
+ *   await using pg = await pgtemp({
+ *     setup: `create table todo (id serial primary key, body text)`,
+ *   });
+ *
+ *   await pg.sql`insert into todo (body) values ('ship it')`;
+ *   const [row] = await pg.sql`select body from todo`;
+ *   console.log(row.body); // "ship it"
+ * });
+ * ```
+ *
+ * @throws If `opts.snapshot` is not a tar or gzip blob, or if `opts.setup` fails.
+ */
 export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   if (opts.snapshot) await assertSnapshot(opts.snapshot);
   const setup = [opts.setup ?? []].flat();
@@ -88,7 +148,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   // reset() swaps the backend; the listener and port survive it, so `url` stays
   // valid and `db`/`sql` are read through getters rather than captured.
   let db: PGlite;
-  let sql: ReturnType<typeof postgres>;
+  let sql: Sql;
   // PGlite is a single backend; multiplexed wire connections (e.g. a driver's
   // pool) must not interleave raw protocol bytes. Serialize every exec.
   let gate = Promise.resolve();

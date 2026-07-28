@@ -1,8 +1,11 @@
 name: publish
 
+# Publishes whenever deno.json's version is one JSR hasn't seen; pushes that
+# don't bump it are skipped, not failed. So the version field is the release
+# trigger — no tag required.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -12,12 +15,12 @@ jobs:
       contents: read
       id-token: write # JSR provenance via OIDC — no token needed
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      # A tag push doesn't trigger ci.yml, so re-run the checks here rather
-      # than publish something unverified.
+      # ci.yml covers this same push, but it is a separate run and cannot gate
+      # this one — so re-check here rather than publish something unverified.
       - run: deno fmt --check
       - run: deno lint
       - run: deno check mod.ts mod.test.ts
