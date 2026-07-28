@@ -74,9 +74,12 @@ await pg.reset(snap); // restore that snapshot exactly — data and DDL
 await pg.reset(); // rebuild what pgtemp() first returned: opts.snapshot + opts.setup
 ```
 
-Two caveats, both from the backend swap:
+One caveat, from the backend swap:
 
 - Read `pg.sql` and `pg.db` off the object each time. They are getters; a destructured `const { sql } = pg` still points
   at the closed pre-reset client.
-- Connections you opened yourself against `pg.url` are dropped by a reset. They have to be: drivers cache prepared
-  statements per connection, and the new backend has never parsed them. postgres.js reconnects on its own.
+
+Connections you opened yourself against `pg.url` survive a reset and need no special handling. A swap does wipe the
+session's prepared statements, so every `Parse` is remembered and replayed into the new backend — your driver's cached
+statement names keep working, and you do not have to reconnect or set `prepare: false`. Session state that is not a
+prepared statement (an open transaction, a `SET`) does not survive; do not reset mid-transaction.

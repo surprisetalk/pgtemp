@@ -246,11 +246,11 @@ Deno.test("adversarial: a rejected reset leaves the instance usable", async () =
   assertEquals(row.n, 5);
 });
 
-// A driver caches prepared statements per connection. If a socket outlives a
-// reset it Binds names the new backend never parsed; postgres.js re-prepares on
+// A driver caches prepared statements per connection. If the swap did not replay
+// them, this Binds a name the new backend never parsed; postgres.js re-prepares on
 // 26000, but a transaction is already aborted by then, so `begin` is where a
-// surviving connection actually breaks.
-Deno.test("adversarial: a reset drops connections opened against url", async () => {
+// surviving connection would break.
+Deno.test("a connection opened against url survives a reset", async () => {
   await using pg = await pgtemp({ setup: `create table t (v text)` });
   const own = postgres(pg.url, { max: 1, onnotice: () => {} });
   const insert = (sql: Sql | postgres.TransactionSql, v: string) => sql`insert into t (v) values (${v})`;
@@ -260,6 +260,62 @@ Deno.test("adversarial: a reset drops connections opened against url", async () 
     await own.begin((tx) => insert(tx, "b")); // same text, so the same cached name
     const [row] = await own`select count(*)::int as n from t`;
     assertEquals(row.n, 1); // reset rebuilt from setup, so only 'b' survives
+  } finally {
+    await own.end();
+  }
+});
+
+// Closing the sockets instead of replaying their statements looked like a fix and
+// was not: the driver only hears about a dead socket from an event, so a query
+// issued first lands on it as `read ECONNRESET` / `write CONNECTION_CLOSED`. One
+// reset rarely catches it — a suite's worth does.
+Deno.test("adversarial: many resets under a long-lived pool", async () => {
+  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  const own = postgres(pg.url, { max: 1, onnotice: () => {} });
+  try {
+    for (let i = 0; i < 60; i++) {
+      await pg.reset();
+      await own`insert into t (v) values (${"a" + i})`;
+      await own.begin(async (tx) => {
+        await tx`insert into t (v) values (${"b" + i})`;
+        await tx`select v from t where v = ${"a" + i}`;
+      });
+      const [row] = await own`select count(*)::int as n from t`;
+      assertEquals(row.n, 2, `cycle ${i} should see only its own two rows`);
+    }
+  } finally {
+    await own.end();
+  }
+});
+
+// Every statement a live connection parsed has to come back, not just the most
+// recent one, and a reset must not resurrect statements from a connection that is
+// already gone. The replayed statements are re-bound inside a transaction on
+// purpose: outside one, postgres.js quietly re-prepares on 26000 and the assertion
+// would hold whether or not anything was replayed.
+Deno.test("a reset replays every cached statement, and only for live connections", async () => {
+  await using pg = await pgtemp({ setup: `create table t (a int, b text)` });
+  const own = postgres(pg.url, { max: 1, onnotice: () => {} });
+  const gone = postgres(pg.url, { max: 1, onnotice: () => {} });
+  try {
+    await gone`insert into t (a, b) values (${1}, ${"gone"})`;
+    await gone.end(); // its statements must not be replayed after this
+    // three distinct query texts, so three distinct cached statement names
+    await own`insert into t (a, b) values (${1}, ${"x"})`;
+    await own`select a from t where a = ${1}`;
+    await own`update t set b = ${"y"} where a = ${1}`;
+    await pg.reset();
+    await own.begin(async (tx) => {
+      // each one Binds its pre-reset name against the new backend
+      await tx`insert into t (a, b) values (${2}, ${"x"})`;
+      const rows = await tx`select a from t where a = ${2}`;
+      assertEquals(rows.length, 1);
+      await tx`update t set b = ${"z"} where a = ${2}`;
+    });
+    const [row] = await own`select b from t where a = ${2}`;
+    assertEquals(row.b, "z");
+    const [count] = await own`select count(*)::int as n from t`;
+    assertEquals(count.n, 1); // the reset cleared 'gone' and 'x' alike
   } finally {
     await own.end();
   }

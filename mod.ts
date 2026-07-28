@@ -50,8 +50,9 @@ export type Pgtemp = {
   /**
    * Restore `snap` exactly — data and DDL. With no argument, rebuild what
    * {@linkcode pgtemp} first returned. The listener survives either way, so
-   * {@linkcode Pgtemp.url} and {@linkcode Pgtemp.port} stay valid, but
-   * connections you opened yourself are dropped.
+   * {@linkcode Pgtemp.url} and {@linkcode Pgtemp.port} stay valid, and so do
+   * connections you opened yourself: their prepared statements are replayed into
+   * the new backend. Other session state (an open transaction, a `SET`) is lost.
    */
   reset: (snap?: Blob) => Promise<void>;
   /** Close the driver, listener, and backend. Idempotent. */
@@ -159,18 +160,51 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   const port = (server.address() as AddressInfo).port;
   const url = `postgresql://postgres@127.0.0.1:${port}/postgres`;
 
-  // A backend swap invalidates every live connection: drivers cache prepared
-  // statements per connection, so a survivor would Bind names the new backend has
-  // never parsed. postgres.js re-prepares on 26000, but inside a transaction the
-  // statement already aborted it — the query dies with `prepared statement "..."
-  // does not exist`. Dropping the sockets forces a reconnect and a fresh cache.
-  const drop = () => {
-    for (const socket of sockets) socket.destroy();
-    sockets.clear();
+  // A backend swap wipes the session's prepared statements, but the drivers on the
+  // other side of the wire still have their names cached, and Bind against a name
+  // the new backend never parsed fails with 26000 — fatally so inside a
+  // transaction, which the driver cannot re-prepare its way out of.
+  //
+  // Closing those connections instead is worse. The driver only learns a socket is
+  // gone from an event, so a query issued before that event lands is written into a
+  // dead socket: `read ECONNRESET`, or `write CONNECTION_CLOSED` on Deno's node
+  // polyfill. Announcing 57P01 in-band first does not help either — postgres.js
+  // reports a FATAL to the caller rather than swallowing it and reconnecting.
+  //
+  // So the connections stay, and their statements come along: every Parse is kept
+  // and replayed into the new backend, which makes a swap invisible from the wire.
+  // Statements live in the session, and PGlite is one session, so replaying the
+  // union of what live connections parsed restores exactly what they expect. They
+  // are held per socket and discarded with it, so resets cannot pile them up.
+  const parsed = new WeakMap<Socket, Map<string, Uint8Array>>();
+  const SYNC = new Uint8Array([0x53, 0, 0, 0, 4]);
+
+  const remember = (socket: Socket, data: Uint8Array) => {
+    // pg-gateway delivers exactly one framed message per call, so this needs no
+    // buffering: 'P' is Parse, and its statement name is the first cstring.
+    if (data[0] !== 0x50) return;
+    const end = data.indexOf(0, 5);
+    const name = new TextDecoder().decode(data.subarray(5, end));
+    if (!name) return; // the unnamed statement never outlives its own Bind
+    const forSocket = parsed.get(socket) ?? new Map<string, Uint8Array>();
+    forSocket.set(name, data.slice());
+    parsed.set(socket, forSocket);
+  };
+
+  const replay = async (into: PGlite) => {
+    for (const socket of sockets) {
+      for (const msg of parsed.get(socket)?.values() ?? []) {
+        const batch = new Uint8Array(msg.length + SYNC.length);
+        batch.set(msg);
+        batch.set(SYNC, msg.length);
+        await into.execProtocolRaw(batch);
+      }
+    }
   };
 
   const stop = async () => {
-    drop();
+    for (const socket of sockets) socket.destroy();
+    sockets.clear();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
 
@@ -213,6 +247,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       await next.close().catch(() => {});
       throw e;
     }
+    await replay(next);
     db = next;
     gate = Promise.resolve();
     sql = postgres(url, {
@@ -233,7 +268,13 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   }
 
   const exec = (data: Uint8Array) => {
-    const run = gate.then(() => db.execProtocolRaw(data));
+    // `ready` as well as the gate: a connection that outlived a swap can send the
+    // next query while the new backend is still booting, and must not be handed
+    // the closed one out of `db`.
+    const run = gate.then(async () => {
+      await ready;
+      return await db.execProtocolRaw(data);
+    });
     gate = run.then(
       () => {},
       () => {},
@@ -253,6 +294,7 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       ) {
         if (!isAuthenticated) return;
         if (data[0] === 88) return; // Terminate
+        remember(socket, data);
         return await exec(data);
       },
     });
@@ -286,9 +328,10 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       if (closed) throw new Error("pgtemp: reset() after close().");
       if (snap) await assertSnapshot(snap); // validate before tearing anything down
       await sql.end();
-      drop(); // connections opened against `url` do not survive the swap
       await db.close();
       try {
+        // `ready` is replaced before the await so that a query arriving on a
+        // surviving connection blocks on the new backend rather than the closed one.
         await (ready = boot(snap ?? opts.snapshot, snap ? [] : setup));
       } catch (e) {
         // The old backend is already gone. Retire the instance so disposal
