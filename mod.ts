@@ -44,6 +44,11 @@ export type Pgtemp = {
   /**
    * A postgres.js client wired to this instance (`max: 1`). Read it off the
    * object each time — like {@linkcode Pgtemp.db}, a reset replaces it.
+   *
+   * Your own driver may pool over {@linkcode Pgtemp.url}: connections take the
+   * backend a transaction at a time. It is still one session, so a `set` or a
+   * temp table is visible to every connection, and a transaction left open
+   * blocks the rest until it ends.
    */
   sql: Sql;
   /** Dump the data dir as an uncompressed tarball, for {@linkcode Pgtemp.reset} or {@linkcode PgtempOpts.snapshot}. */
@@ -147,6 +152,37 @@ const refuseNamed = (data: Uint8Array) => {
   });
 };
 
+// A simple Query frame: 'Q', length (self-inclusive, type byte excluded), SQL.
+// Outside a transaction this is a no-op that warns, which is the right shape for
+// a cleanup that cannot know.
+const ROLLBACK = new Uint8Array([0x51, 0, 0, 0, 13, ...new TextEncoder().encode("rollback\0")]);
+
+// True when the backend finished this batch outside a transaction — the only
+// point another connection may take it. Frames are walked rather than scanned
+// for 0x5a, because row data contains that byte all the time. A batch can carry
+// several ReadyForQuery (one per Sync in a pipeline); the last one is the state
+// the backend is actually left in. Empty output (Parse, Bind) means "still
+// mid-statement", so the answer is no.
+const idle = (out: Uint8Array) => {
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  let status = 0;
+  for (let i = 0; i < out.length;) {
+    // Length excludes the type byte and includes itself, so a frame is 1 + len.
+    if (i + 5 > out.length) throw new Error(`pgtemp: truncated backend frame at byte ${i} of ${out.length}.`);
+    const len = view.getUint32(i + 1);
+    if (len < 4 || i + 1 + len > out.length) {
+      throw new Error(
+        `pgtemp: backend frame '${String.fromCharCode(out[i])}' at byte ${i} claims ${len} bytes, of ${
+          out.length - i - 1
+        } left.`,
+      );
+    }
+    if (out[i] === 0x5a) status = out[i + 5]; // ReadyForQuery: 'I' idle, 'T' in one, 'E' failed
+    i += 1 + len;
+  }
+  return status === 0x49;
+};
+
 /**
  * Start an ephemeral in-memory Postgres and return once it is accepting queries.
  *
@@ -197,16 +233,33 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
 
+  // Declared up here rather than next to close(): the listener is already
+  // accepting, and a socket that opens and dies during boot reads it.
+  let closed = false;
   // reset() swaps the backend; the listener and port survive it, so `url` stays
   // valid and `db`/`sql` are read through getters rather than captured.
   let db: PGlite;
   let sql: Sql;
-  // PGlite is a single backend; multiplexed wire connections (e.g. a driver's
-  // pool) must not interleave raw protocol bytes. Serialize every exec.
-  let gate = Promise.resolve();
   // A connection accepted mid-swap must wait for the new backend rather than read
   // the closed one out of `db`.
   let ready: Promise<void>;
+
+  // PGlite is one backend session, so connections take turns holding it — for a
+  // whole transaction, not a message, or a pool's two halves interleave inside
+  // one. Ownership is handed straight to the next waiter (FIFO), never dropped
+  // and re-contested, so a busy pool cannot starve a connection.
+  const waiting: (() => void)[] = [];
+  let leased = false;
+  const lease = () => {
+    if (leased) return new Promise<void>((resolve) => waiting.push(resolve));
+    leased = true;
+    return Promise.resolve();
+  };
+  const unlease = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else leased = false;
+  };
 
   const boot = async (snap: Blob | undefined, stmts: string[]) => {
     const next = new PGlite({
@@ -237,11 +290,10 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       throw e;
     }
     db = next;
-    gate = Promise.resolve();
     sql = postgres(url, {
-      // max: 1 — PGlite is a single session; one wire connection keeps the
-      // statement/portal/transaction namespace coherent. postgres.js still
-      // pipelines overlapping queries over that one connection, in order.
+      // max: 1 — a pool would work now, but buys nothing: one backend runs one
+      // transaction at a time either way, and postgres.js already pipelines
+      // overlapping queries over a single connection, in order.
       max: 1,
       prepare: false, // see refuseNamed
       fetch_types: true,
@@ -256,22 +308,27 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
     throw e;
   }
 
-  const exec = (data: Uint8Array) => {
-    // `ready` as well as the gate: a connection that outlived a swap can send the
-    // next query while the new backend is still booting, and must not be handed
-    // the closed one out of `db`.
-    const run = gate.then(async () => {
-      await ready;
-      return await db.execProtocolRaw(data);
-    });
-    gate = run.then(
-      () => {},
-      () => {},
-    );
-    return run;
-  };
-
   server.on("connection", async (socket) => {
+    // Held across messages, not per message: Parse/Bind/Execute answer with zero
+    // bytes and settle nothing, so the backend only changes hands where the
+    // backend itself says it is between transactions.
+    let holds = false;
+    const done = () => {
+      if (!holds) return;
+      holds = false;
+      unlease();
+    };
+    // Holding the lease at close means the client vanished mid-transaction. A
+    // real backend would exit and take its transaction with it; this one is a
+    // shared session that just keeps going, so the next connection to be handed
+    // it would find itself inside a stranger's open transaction. Roll back
+    // first, still under the lease, and only then let go.
+    socket.on("close", () => {
+      if (!holds) return;
+      if (closed) return done(); // the whole instance is going away
+      db.execProtocolRaw(ROLLBACK).catch(() => {}).finally(done);
+    });
+
     await fromNodeSocket(socket, {
       async onStartup() {
         await ready;
@@ -280,16 +337,41 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       async onMessage(
         data: Uint8Array,
         { isAuthenticated }: { isAuthenticated: boolean },
-      ) {
+      ): Promise<Uint8Array | undefined> {
         if (!isAuthenticated) return;
-        if (data[0] === 88) return; // Terminate
+        if (data[0] === 88) { // Terminate
+          done();
+          return;
+        }
         refuseNamed(data);
-        return await exec(data);
+        if (!holds) {
+          await lease();
+          holds = true;
+        }
+        try {
+          // `ready` as well as the lease: a connection that outlived a swap can
+          // send the next query while the new backend is still booting, and must
+          // not be handed the closed one out of `db`.
+          await ready;
+          // .slice() copies. execProtocolRaw returns a view straight into the
+          // WASM heap, and the socket write is queued, not immediate — so the
+          // next connection's exec reuses that memory and rewrites bytes already
+          // promised to this one. It corrupts tail-first: a client would get a
+          // 6-byte ReadyForQuery whose type byte had turned into someone else's
+          // NoticeResponse, and hang forever waiting for a frame it was already
+          // sent. Harmless while only one connection is ever in flight, which is
+          // why it stayed hidden.
+          const out = (await db.execProtocolRaw(data)).slice();
+          if (idle(out)) done();
+          return out;
+        } catch (e) {
+          done();
+          throw e;
+        }
       },
     });
   });
 
-  let closed = false;
   const close = async () => {
     if (closed) return;
     closed = true;

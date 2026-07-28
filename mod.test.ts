@@ -32,6 +32,9 @@ import { tsm_system_time } from "@electric-sql/pglite/contrib/tsm_system_time";
 import { unaccent } from "@electric-sql/pglite/contrib/unaccent";
 import { uuid_ossp } from "@electric-sql/pglite/contrib/uuid_ossp";
 import postgres from "postgres";
+import { connect } from "node:net";
+import type { Socket } from "node:net";
+import type { Buffer } from "node:buffer";
 import { pgtemp, type Sql } from "./mod.ts";
 
 Deno.test("happy path: connect and select 1", async () => {
@@ -103,7 +106,7 @@ Deno.test("adversarial: querying after close fails loudly", async () => {
 });
 
 Deno.test(
-  "adversarial: overlapping queries don't corrupt (single-connection PGlite)",
+  "adversarial: overlapping queries on one connection don't corrupt",
   async () => {
     await using pg = await pgtemp({ setup: `create table nums (n int)` });
     await Promise.all(
@@ -342,6 +345,116 @@ Deno.test("the bundled client never names a statement, across a reset", async ()
   assertEquals(row.b, "z");
   const [count] = await pg.sql`select count(*)::int as n from t`;
   assertEquals(count.n, 1); // the reset cleared the pre-reset row
+});
+
+// One backend, many clients. The bytes a connection is promised must reach it
+// unchanged, and a transaction must not be cut in half by another connection's
+// statements. Everything below is about those two properties.
+
+Deno.test("a pooled driver runs concurrent queries across connections", async () => {
+  await using pg = await pgtemp({ setup: `create table t (id serial primary key, v int)` });
+  const own = postgres(pg.url, { max: 8, prepare: false, onnotice: () => {} });
+  try {
+    const rows = await Promise.all(
+      Array.from({ length: 40 }, (_, i) => own`insert into t (v) values (${i}) returning id`),
+    );
+    assertEquals(rows.length, 40);
+    const [row] = await own`select count(*)::int as c, sum(v)::int as s from t`;
+    assertEquals([row.c, row.s], [40, 780]);
+    // every insert got a distinct id — none was answered with another's bytes
+    assertEquals(new Set(rows.map((r) => r[0].id)).size, 40);
+  } finally {
+    await own.end();
+  }
+});
+
+// The one that fails loudly if the backend changes hands mid-transaction: a
+// rollback would take the interleaved connection's rows down with it, and a
+// commit would keep rows that were supposed to vanish.
+Deno.test("adversarial: concurrent transactions do not interleave", async () => {
+  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  const own = postgres(pg.url, { max: 6, prepare: false, onnotice: () => {} });
+  try {
+    const results = await Promise.allSettled(
+      Array.from({ length: 12 }, (_, i) =>
+        own.begin(async (tx) => {
+          await tx`insert into t (v) values (${"row" + i})`;
+          await tx`select pg_sleep(0.005)`; // widen the window a real interleave would use
+          await tx`insert into t (v) values (${"row" + i + "b"})`;
+          if (i % 2 === 1) throw new Error("rollback " + i);
+        })),
+    );
+    assertEquals(results.filter((r) => r.status === "fulfilled").length, 6);
+    const kept = (await own`select v from t order by v`).map((r) => r.v);
+    assertEquals(kept.length, 12); // 6 committed transactions, 2 rows each
+    for (let i = 0; i < 12; i += 2) {
+      assertEquals(kept.includes("row" + i), true, `row${i} committed but is missing`);
+      assertEquals(kept.includes("row" + (i + 1)), false, `row${i + 1} rolled back but survived`);
+    }
+  } finally {
+    await own.end();
+  }
+});
+
+// A raw socket, because postgres.js is too well behaved to reproduce this: the
+// client has to disappear with a transaction still open. PGlite's session does
+// not die with the socket, so without cleanup the next connection inherits it.
+const startup = () => {
+  const params = new TextEncoder().encode("user\0postgres\0database\0postgres\0\0");
+  const out = new Uint8Array(8 + params.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, out.length);
+  view.setUint32(4, 196608); // protocol 3.0
+  out.set(params, 8);
+  return out;
+};
+
+const query = (sql: string) => {
+  const body = new TextEncoder().encode(sql + "\0");
+  const out = new Uint8Array(5 + body.length);
+  out[0] = 0x51; // 'Q'
+  new DataView(out.buffer).setUint32(1, 4 + body.length);
+  out.set(body, 5);
+  return out;
+};
+
+// Resolves on the next ReadyForQuery, whose status byte says whether the backend
+// is idle ('I'), in a transaction ('T'), or in a failed one ('E').
+const untilReady = (socket: Socket) =>
+  new Promise<string>((resolve, reject) => {
+    const onData = (chunk: Buffer) => {
+      for (let i = 0; i + 5 < chunk.length; i += 1 + chunk.readUInt32BE(i + 1)) {
+        if (chunk[i] === 0x5a) {
+          socket.off("data", onData);
+          return resolve(String.fromCharCode(chunk[i + 5]));
+        }
+      }
+    };
+    socket.on("data", onData);
+    socket.once("error", reject);
+  });
+
+Deno.test("adversarial: a client that dies mid-transaction does not strand the backend", async () => {
+  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  const socket = connect(pg.port, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+
+  socket.write(startup());
+  assertEquals(await untilReady(socket), "I");
+  socket.write(query("begin; insert into t (v) values ('ghost')"));
+  assertEquals(await untilReady(socket), "T"); // open transaction, uncommitted row
+  socket.destroy();
+
+  // The instance must still answer — not deadlock behind a lease nobody will
+  // release — and must not have inherited the abandoned transaction.
+  const [row] = await pg.sql`select count(*)::int as n from t`;
+  assertEquals(row.n, 0, "the dead client's uncommitted row survived");
+  await pg.sql`insert into t (v) values ('after')`;
+  const [after] = await pg.sql`select count(*)::int as n from t`;
+  assertEquals(after.n, 1, "writes after the abandoned transaction did not commit");
 });
 
 Deno.test("adversarial: bad setup SQL names the offending statement", async () => {

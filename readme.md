@@ -34,7 +34,7 @@ Deno.test("my query", async () => {
 
 - `sql` — a bundled [postgres.js](https://github.com/porsager/postgres) client, wired to the instance (`max: 1`,
   `prepare: false`).
-- `url` — the connection string, if you'd rather bring your own driver.
+- `url` — the connection string, if you'd rather bring your own driver. Pools are fine; see [Connections](#connections).
 - `db` — the raw `PGlite` handle (`.exec`, `.query`).
 - `port` — the OS-assigned free port.
 - `snapshot()` / `reset()` — see below.
@@ -74,6 +74,17 @@ const snap = await pg.snapshot();
 await pg.reset(snap); // restore that snapshot exactly — data and DDL
 await pg.reset(); // rebuild what pgtemp() first returned: opts.snapshot + opts.setup
 ```
+
+## Connections
+
+Point a connection pool at `url` and it works — connections take the backend one transaction at a time, so nothing
+interleaves. It is still a single Postgres session underneath, which means:
+
+- Session state is shared. A `set`, a temp table, or a `listen` on one connection is visible on all of them.
+- One transaction runs at a time. A connection that opens a transaction and sits on it blocks every other connection
+  until it commits, rolls back, or disconnects — you cannot deadlock two transactions against each other, because the
+  second one never starts.
+- No named prepared statements, on any connection: use `prepare: false`.
 
 Two caveats, from the backend swap:
 
