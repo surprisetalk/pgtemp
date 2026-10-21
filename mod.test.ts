@@ -43,6 +43,24 @@ Deno.test("happy path: connect and select 1", async () => {
   assertEquals(row.n, 1);
 });
 
+// pg-gateway writes each reply message on its own. With Nagle on, every write after
+// the first waits for the client's delayed ACK, 40ms on Linux, so a query that takes a
+// millisecond took ~85ms.
+Deno.test("a query round trip does not wait on a delayed ACK", async () => {
+  await using pg = await pgtemp();
+  await pg.sql`select 1`;
+  const n = 50;
+  const t = performance.now();
+  for (let i = 0; i < n; i++) await pg.sql`select ${i}::int as i`;
+  const ms = performance.now() - t;
+  if (ms > 1000) {
+    throw new Error(
+      `${n} sequential queries took ${ms.toFixed(0)}ms. expected under 1000ms; ` +
+        `at 40ms or more a query, a socket writes with Nagle on. likely fix: noDelay on the listener.`,
+    );
+  }
+});
+
 Deno.test("setup SQL runs before first query", async () => {
   await using pg = await pgtemp({
     setup: `create table t (id int); insert into t values (42);`,

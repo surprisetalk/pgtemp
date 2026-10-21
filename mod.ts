@@ -217,6 +217,9 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   const sockets = new Set<Socket>();
   const server = createServer();
   server.on("connection", (socket) => {
+    // pg-gateway writes each reply message on its own, and with Nagle on each write
+    // after the first waits for the client's delayed ACK: ~85ms a query on Linux.
+    socket.setNoDelay(true);
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
