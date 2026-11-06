@@ -1,10 +1,17 @@
 #!/bin/sh
-# Same checks as .github/workflows/ci.yml, in the same order: a commit that
-# passes here passes CI. Skip with `git commit --no-verify`.
+# The deno checks match .github/workflows/ci.yml, in the same order: a commit
+# that passes here passes CI. gitleaks and shellcheck run only here. Skip with `git commit --no-verify`.
 set -e
-# REVIEW: deno audit needs the network, and a new advisory blocks unrelated commits. Alternative: a status condition. It allows offline commits but lets a vulnerable dependency ship.
+for tool in gitleaks shellcheck; do command -v "$tool" >/dev/null || { echo "pre-commit: expected $tool on PATH, received none. Fix: brew install $tool" >&2; exit 1; }; done
+# REVIEW: gitleaks scans each commit that main@origin lacks, @ included. Alternative: gitleaks dir. It ignores .gitignore, so it scans .env and node_modules.
+ids=$(jj log --no-graph -r 'trunk()..@' -T 'commit_id ++ " "')
+gitleaks git --no-banner --redact -v --log-level warn --log-opts="--no-walk ${ids% }"
+jj file list 'glob:**/*.sh' | xargs shellcheck -x -P SCRIPTDIR .githooks/pre-commit
+# deno audit needs the network, and a new advisory blocks unrelated commits. Alternative: a status condition. It allows offline commits but lets a vulnerable dependency ship.
 timeout 30 deno audit
 deno fmt --check || { printf '\n  fix with: deno fmt\n\n'; exit 1; }
 deno lint
 deno check mod.ts mod.test.ts
 deno task test
+# jj leaves the change in @, so git always sees a dirty tree.
+deno publish --dry-run --allow-dirty
