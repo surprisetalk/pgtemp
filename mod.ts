@@ -20,10 +20,10 @@ export type PgtempOpts = {
   /** SQL run once, before the instance is returned. */
   setup?: string | string[];
   /**
-   * A snapshot from {@linkcode Pgtemp.snapshot} to boot from, instead of a cold
-   * start. Roughly 3x faster, and independent of how much schema it holds.
-   * {@linkcode PgtempOpts.setup} still runs afterwards, so a shared base
-   * composes with per-instance extras.
+   * A snapshot from {@linkcode Pgtemp.snapshot} to boot from, instead of an
+   * empty cluster. Boot time does not depend on how much schema it holds, so
+   * migrations run once rather than per instance. {@linkcode PgtempOpts.setup}
+   * still runs afterwards, so a shared base composes with per-instance extras.
    */
   snapshot?: Blob;
   /** Called for every Postgres notice. Defaults to swallowing them. */
@@ -183,6 +183,13 @@ const idle = (out: Uint8Array) => {
   return status === 0x49;
 };
 
+// REVIEW: initdb runs once per process. The first cold boot dumps its data dir
+// before setup, and every later cold boot or reset() loads that dump: ~100ms
+// instead of ~350ms. Extensions live outside the data dir, so one dump serves
+// every opts.extensions. Alternative: initdb per boot. It costs ~250ms on each
+// pgtemp() and reset(), and the 28MB this holds would be freed.
+let fresh: Promise<Blob> | undefined;
+
 /**
  * Start an ephemeral in-memory Postgres and return once it is accepting queries.
  *
@@ -265,12 +272,25 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
   };
 
   const boot = async (snap: Blob | undefined, stmts: string[]) => {
+    // No await between the check and the assignment of `fresh`, so concurrent
+    // first boots run initdb once.
+    const initdb = !snap && !fresh;
     const next = new PGlite({
       extensions: opts.extensions,
-      loadDataDir: snap,
+      loadDataDir: snap ?? (fresh && await fresh),
     });
+    // A failed initdb can come from this call's opts.extensions, so it must not
+    // fail the boots after it. Concurrent boots that await it fail with it.
+    const dump = initdb
+      ? next.waitReady.then(() => next.dumpDataDir("none")).catch((e) => {
+        fresh = undefined;
+        throw e;
+      })
+      : undefined;
+    if (dump) fresh = dump;
     try {
-      await next.waitReady;
+      // Setup must not start before the dump ends, or the dump can hold part of it.
+      await (dump ?? next.waitReady);
       for (const stmt of stmts) {
         try {
           await next.exec(stmt);
