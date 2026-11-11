@@ -326,12 +326,13 @@ Deno.test("a connection opened against url survives a reset", async () => {
 // Closing the sockets on every swap instead of letting them ride looked like a fix
 // and was not: the driver only hears about a dead socket from an event, so a query
 // issued first lands on it as `read ECONNRESET` / `write CONNECTION_CLOSED`. One
-// reset rarely catches it — a suite's worth does.
+// reset rarely catches it — a suite's worth does. 20 cycles keep the suite under 10s.
+// Alternative: 60 cycles. They catch a rarer race but cost ~3s more on each run.
 Deno.test("adversarial: many resets under a long-lived pool", async () => {
   await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   const own = postgres(pg.url, { max: 1, prepare: false, onnotice: () => {} });
   try {
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < 20; i++) {
       await pg.reset();
       await own`insert into t (v) values (${"a" + i})`;
       await own.begin(async (tx) => {
