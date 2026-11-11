@@ -3,7 +3,7 @@
   "specifiers": {
     "jsr:@std/assert@^1.0.19": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.13",
-    "npm:@electric-sql/pglite@0.3.15": "0.3.15",
+    "npm:@electric-sql/pglite@0.5.16": "0.5.16",
     "npm:pg-gateway@0.3.0-beta.4": "0.3.0-beta.4",
     "npm:postgres@^3.4.5": "3.4.9"
   },
@@ -19,8 +19,8 @@
     }
   },
   "npm": {
-    "@electric-sql/pglite@0.3.15": {
-      "integrity": "sha512-Cj++n1Mekf9ETfdc16TlDi+cDDQF0W7EcbyRHYOAeZdsAe8M/FJg18itDTSwyHfar2WIezawM9o0EKaRGVKygQ=="
+    "@electric-sql/pglite@0.5.16": {
+      "integrity": "sha512-Nj8KcIsJL748W408U2N8q4+9IlONdpRIU8MJypIAAINMJ5nqKyqpX7Mgg/5XKkXiAib3AoZGR6hnJFlrlLBrcg=="
     },
     "pg-gateway@0.3.0-beta.4": {
       "integrity": "sha512-CTjsM7Z+0Nx2/dyZ6r8zRsc3f9FScoD5UAOlfUx1Fdv/JOIWvRbF7gou6l6vP+uypXQVoYPgw8xZDXgMGvBa4Q=="
@@ -32,7 +32,7 @@
   "workspace": {
     "dependencies": [
       "jsr:@std/assert@^1.0.19",
-      "npm:@electric-sql/pglite@0.3.15",
+      "npm:@electric-sql/pglite@0.5.16",
       "npm:pg-gateway@0.3.0-beta.4",
       "npm:postgres@^3.4.5"
     ]

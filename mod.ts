@@ -185,21 +185,32 @@ const idle = (out: Uint8Array) => {
 
 // REVIEW: Warn once, at the second boot without a snapshot in a process. The first
 // cold boot is also how a snapshot gets built, so a warning there flags correct use.
-// Alternative: cache the first initdb and boot later instances from it. It is ~3x
-// faster with no change by the caller, but it holds 28MB and hides the cost.
+// Alternative: cache the first initdb and boot later instances from it. It is
+// faster with no change by the caller, but it holds a whole data dir in memory and
+// hides the cost.
 let colds = 0;
 const COLD = `pgtemp: this process booted a second empty cluster, and each one runs initdb.
 
   Expected: one boot without a snapshot, to build one, then boots from it.
   Received: a second pgtemp() or reset() with no snapshot to boot from.
 
-  initdb makes a boot about 3x slower than a boot from a snapshot. Build the
-  snapshot once, at the top of the test file:
+  initdb makes a boot slower than a boot from a snapshot. Build the snapshot
+  once, at the top of the test file, and cache it on disk. The file name hashes
+  MIGRATIONS and deno.lock, so a new migration or a pgtemp upgrade builds a new
+  snapshot. /tmp clears old snapshots on its own.
 
-    const snapshot = await (async () => {
+    const key = new TextEncoder().encode(MIGRATIONS + await Deno.readTextFile("deno.lock"));
+    const path = \`/tmp/pgtemp/\${new Uint8Array(await crypto.subtle.digest("SHA-256", key)).toHex()}.tar\`;
+    const snapshot = await Deno.readFile(path).then((b) => new Blob([b]), async (e) => {
+      if (!(e instanceof Deno.errors.NotFound)) throw e;
       await using pg = await pgtemp({ setup: MIGRATIONS });
-      return await pg.snapshot();
-    })();
+      const snap = await pg.snapshot();
+      await Deno.mkdir("/tmp/pgtemp", { recursive: true });
+      const tmp = \`\${path}.\${crypto.randomUUID()}\`; // rename: parallel files never read half a file
+      await Deno.writeFile(tmp, snap.stream());
+      await Deno.rename(tmp, path);
+      return snap;
+    });
 
     await using pg = await pgtemp({ snapshot }); // in each test; pg.reset() reuses it
 `;
@@ -292,7 +303,24 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
       loadDataDir: snap,
     });
     try {
-      await next.waitReady;
+      // PGlite says only "failed to initialize properly" when a data dir comes from
+      // another Postgres major, which is what a snapshot cached on disk across a
+      // pgtemp upgrade looks like.
+      await next.waitReady.catch((e) => {
+        if (!snap) throw e;
+        throw new Error(
+          `pgtemp: PGlite could not boot this snapshot.
+
+  Expected: a snapshot that this version of pgtemp wrote.
+  Received: ${e instanceof Error ? e.message : String(e)}
+
+  The data dir format follows the Postgres major version, and a pgtemp upgrade
+  can change it. If you cache snapshots on disk, delete this one, and put the
+  pgtemp version in its cache key, as the readme's Snapshots section does.
+`,
+          { cause: e },
+        );
+      });
       for (const stmt of stmts) {
         try {
           await next.exec(stmt);

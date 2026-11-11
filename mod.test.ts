@@ -37,23 +37,35 @@ import type { Socket } from "node:net";
 import type { Buffer } from "node:buffer";
 import { pgtemp, type Sql } from "./mod.ts";
 
+// Every test boots from this one, because a boot from a snapshot skips initdb. The
+// recipe is the one in the cold-boot warning and the readme, word for word, so that
+// a run here proves it.
+const MIGRATIONS = "";
+const key = new TextEncoder().encode(MIGRATIONS + await Deno.readTextFile("deno.lock"));
+const path = `/tmp/pgtemp/${new Uint8Array(await crypto.subtle.digest("SHA-256", key)).toHex()}.tar`;
+const base = await Deno.readFile(path).then((b) => new Blob([b]), async (e) => {
+  if (!(e instanceof Deno.errors.NotFound)) throw e;
+  await using pg = await pgtemp({ setup: MIGRATIONS });
+  const snap = await pg.snapshot();
+  await Deno.mkdir("/tmp/pgtemp", { recursive: true });
+  const tmp = `${path}.${crypto.randomUUID()}`; // rename: parallel files never read half a file
+  await Deno.writeFile(tmp, snap.stream());
+  await Deno.rename(tmp, path);
+  return snap;
+});
+
 // This test must stay first in the file: the warning fires once per process, at the
-// second boot without a snapshot.
+// second boot without a snapshot. `base` is the first only when /tmp/pgtemp misses, so
+// three cold boots give exactly one warning either way.
 Deno.test("a second cold boot warns once, with the snapshot fix", async () => {
   const warn = console.warn;
   const warned: string[] = [];
   console.warn = (msg: string) => warned.push(msg);
   try {
-    const snapshot = await (async () => {
-      await using pg = await pgtemp();
-      return await pg.snapshot();
-    })();
-    assertEquals(warned, []);
-    await using pg = await pgtemp({ snapshot });
+    await using pg = await pgtemp({ snapshot: base });
     await pg.reset();
     assertEquals(warned, []);
-    await (await pgtemp()).close();
-    await (await pgtemp()).close();
+    for (let i = 0; i < 3; i++) await (await pgtemp()).close();
     assertEquals(warned.length, 1);
     assertStringIncludes(warned[0], "pgtemp({ snapshot })");
   } finally {
@@ -62,7 +74,7 @@ Deno.test("a second cold boot warns once, with the snapshot fix", async () => {
 });
 
 Deno.test("happy path: connect and select 1", async () => {
-  await using pg = await pgtemp();
+  await using pg = await pgtemp({ snapshot: base });
   const [row] = await pg.sql`select 1 as n`;
   assertEquals(row.n, 1);
 });
@@ -71,7 +83,7 @@ Deno.test("happy path: connect and select 1", async () => {
 // the first waits for the client's delayed ACK, 40ms on Linux, so a query that takes a
 // millisecond took ~85ms.
 Deno.test("a query round trip does not wait on a delayed ACK", async () => {
-  await using pg = await pgtemp();
+  await using pg = await pgtemp({ snapshot: base });
   await pg.sql`select 1`;
   const n = 50;
   const t = performance.now();
@@ -86,28 +98,20 @@ Deno.test("a query round trip does not wait on a delayed ACK", async () => {
 });
 
 Deno.test("setup SQL runs before first query", async () => {
-  await using pg = await pgtemp({
-    setup: `create table t (id int); insert into t values (42);`,
-  });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (id int); insert into t values (42);` });
   const [row] = await pg.sql`select id from t`;
   assertEquals(row.id, 42);
 });
 
 Deno.test("setup accepts an array of statements", async () => {
-  await using pg = await pgtemp({
-    setup: [`create table a (x int)`, `insert into a values (1), (2)`],
-  });
+  await using pg = await pgtemp({ snapshot: base, setup: [`create table a (x int)`, `insert into a values (1), (2)`] });
   const [row] = await pg.sql`select count(*)::int as c from a`;
   assertEquals(row.c, 2);
 });
 
 Deno.test("concurrent instances: distinct ports, isolated data", async () => {
-  await using a = await pgtemp({
-    setup: `create table m (v text); insert into m values ('a')`,
-  });
-  await using b = await pgtemp({
-    setup: `create table m (v text); insert into m values ('b')`,
-  });
+  await using a = await pgtemp({ snapshot: base, setup: `create table m (v text); insert into m values ('a')` });
+  await using b = await pgtemp({ snapshot: base, setup: `create table m (v text); insert into m values ('b')` });
   assertNotEquals(a.port, b.port);
   const [ra] = await a.sql`select v from m`;
   const [rb] = await b.sql`select v from m`;
@@ -116,6 +120,7 @@ Deno.test("concurrent instances: distinct ports, isolated data", async () => {
 
 Deno.test("extensions load (citext)", async () => {
   await using pg = await pgtemp({
+    snapshot: base,
     extensions: { citext },
     setup: `create extension if not exists citext; create table u (name citext); insert into u values ('Foo')`,
   });
@@ -129,7 +134,7 @@ Deno.test("extensions load (citext)", async () => {
 // guarantee. (Immediate port re-bind is unreliable: a client socket lingers in
 // TIME_WAIT, which is OS behavior, not a leak.) close() must also be idempotent.
 Deno.test("teardown is clean and idempotent", async () => {
-  const pg = await pgtemp();
+  const pg = await pgtemp({ snapshot: base });
   await pg.close();
   await pg.close();
 });
@@ -137,12 +142,12 @@ Deno.test("teardown is clean and idempotent", async () => {
 Deno.test(
   "adversarial: bad setup SQL surfaces an error, not a hang",
   async () => {
-    await assertRejects(() => pgtemp({ setup: `this is not valid sql` }));
+    await assertRejects(() => pgtemp({ snapshot: base, setup: `this is not valid sql` }));
   },
 );
 
 Deno.test("adversarial: querying after close fails loudly", async () => {
-  const pg = await pgtemp();
+  const pg = await pgtemp({ snapshot: base });
   await pg.close();
   await assertRejects(() => pg.sql`select 1`);
 });
@@ -150,7 +155,7 @@ Deno.test("adversarial: querying after close fails loudly", async () => {
 Deno.test(
   "adversarial: overlapping queries on one connection don't corrupt",
   async () => {
-    await using pg = await pgtemp({ setup: `create table nums (n int)` });
+    await using pg = await pgtemp({ snapshot: base, setup: `create table nums (n int)` });
     await Promise.all(
       Array.from(
         { length: 25 },
@@ -164,7 +169,7 @@ Deno.test(
 );
 
 Deno.test("snapshot round-trips data and DDL", async () => {
-  await using pg = await pgtemp({ setup: `create table t (n int)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (n int)` });
   await pg.sql`insert into t values (1)`;
   const snap = await pg.snapshot();
 
@@ -178,9 +183,7 @@ Deno.test("snapshot round-trips data and DDL", async () => {
 });
 
 Deno.test("reset() with no snapshot rebuilds setup", async () => {
-  await using pg = await pgtemp({
-    setup: [`create table t (n int)`, `insert into t values (7)`],
-  });
+  await using pg = await pgtemp({ snapshot: base, setup: [`create table t (n int)`, `insert into t values (7)`] });
   await pg.sql`drop table t`;
   await pg.reset();
   const [row] = await pg.sql`select n from t`;
@@ -188,7 +191,7 @@ Deno.test("reset() with no snapshot rebuilds setup", async () => {
 });
 
 Deno.test("reset keeps the listener: url and port survive", async () => {
-  await using pg = await pgtemp();
+  await using pg = await pgtemp({ snapshot: base });
   const { url, port } = pg;
   await pg.reset();
   assertEquals([pg.url, pg.port], [url, port]);
@@ -198,6 +201,7 @@ Deno.test("reset keeps the listener: url and port survive", async () => {
 
 Deno.test("pgtemp({ snapshot }) boots restored, and stays isolated", async () => {
   await using seed = await pgtemp({
+    snapshot: base,
     setup: `create table t (v text); insert into t values ('seeded')`,
   });
   const snapshot = await seed.snapshot();
@@ -211,7 +215,7 @@ Deno.test("pgtemp({ snapshot }) boots restored, and stays isolated", async () =>
 });
 
 Deno.test("snapshot composes with setup: shared base, per-instance extras", async () => {
-  await using seed = await pgtemp({ setup: `create table base (n int)` });
+  await using seed = await pgtemp({ snapshot: base, setup: `create table base (n int)` });
   const snapshot = await seed.snapshot();
 
   await using pg = await pgtemp({
@@ -225,6 +229,7 @@ Deno.test("snapshot composes with setup: shared base, per-instance extras", asyn
 
 Deno.test("snapshot round-trips an extension", async () => {
   await using seed = await pgtemp({
+    snapshot: base,
     extensions: { citext },
     setup: `create extension citext; create table u (name citext); insert into u values ('Foo')`,
   });
@@ -237,7 +242,7 @@ Deno.test("snapshot round-trips an extension", async () => {
 });
 
 Deno.test("adversarial: snapshot() and reset() after close fail loudly", async () => {
-  const pg = await pgtemp();
+  const pg = await pgtemp({ snapshot: base });
   await pg.close();
   await assertRejects(() => pg.snapshot(), Error, "after close()");
   await assertRejects(() => pg.reset(), Error, "after close()");
@@ -249,6 +254,19 @@ Deno.test("adversarial: snapshot() and reset() after close fail loudly", async (
 Deno.test("adversarial: a garbage snapshot is rejected, not booted empty", async () => {
   const e = await assertRejects(() => pgtemp({ snapshot: new Blob([new Uint8Array([1, 2, 3, 4])]) }));
   assertStringIncludes((e as Error).message, "not a snapshot");
+});
+
+// A snapshot cached on disk outlives a pgtemp upgrade, and a new PGlite can run a
+// new Postgres major. PGlite then throws only "failed to initialize properly".
+Deno.test("adversarial: a snapshot from another Postgres major names the fix", async () => {
+  const tar = new Uint8Array(await base.arrayBuffer());
+  const name = new TextEncoder().encode("/PG_VERSION\0");
+  let at = -1;
+  for (let i = 0; i < tar.length && at < 0; i += 512) if (name.every((b, j) => tar[i + j] === b)) at = i;
+  tar.set(new TextEncoder().encode("17"), at + 512); // the file's body follows its 512-byte header
+  const e = await assertRejects(() => pgtemp({ snapshot: new Blob([tar]) }));
+  assertStringIncludes((e as Error).message, "could not boot this snapshot");
+  assertStringIncludes((e as Error).message, "pgtemp version in its cache key");
 });
 
 // A gzip header is trivially forgeable and PGlite boots the result as an empty
@@ -266,9 +284,7 @@ Deno.test("adversarial: a valid gzip of non-tar bytes is rejected", async () => 
 });
 
 Deno.test("a gzip-compressed snapshot is still accepted", async () => {
-  await using seed = await pgtemp({
-    setup: `create table t (v text); insert into t values ('gz')`,
-  });
+  await using seed = await pgtemp({ snapshot: base, setup: `create table t (v text); insert into t values ('gz')` });
   const snapshot = new Blob([
     await new Response(
       (await seed.snapshot()).stream().pipeThrough(
@@ -283,9 +299,7 @@ Deno.test("a gzip-compressed snapshot is still accepted", async () => {
 });
 
 Deno.test("adversarial: a rejected reset leaves the instance usable", async () => {
-  await using pg = await pgtemp({
-    setup: `create table t (n int); insert into t values (5)`,
-  });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (n int); insert into t values (5)` });
   await assertRejects(() => pg.reset(new Blob(["nonsense"])));
   const [row] = await pg.sql`select n from t`;
   assertEquals(row.n, 5);
@@ -295,7 +309,7 @@ Deno.test("adversarial: a rejected reset leaves the instance usable", async () =
 // across it. The transaction matters: outside one, postgres.js papers over a
 // broken session by reconnecting, and the assertion would hold either way.
 Deno.test("a connection opened against url survives a reset", async () => {
-  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   const own = postgres(pg.url, { max: 1, prepare: false, onnotice: () => {} });
   const insert = (sql: Sql | postgres.TransactionSql, v: string) => sql`insert into t (v) values (${v})`;
   try {
@@ -314,7 +328,7 @@ Deno.test("a connection opened against url survives a reset", async () => {
 // issued first lands on it as `read ECONNRESET` / `write CONNECTION_CLOSED`. One
 // reset rarely catches it — a suite's worth does.
 Deno.test("adversarial: many resets under a long-lived pool", async () => {
-  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   const own = postgres(pg.url, { max: 1, prepare: false, onnotice: () => {} });
   try {
     for (let i = 0; i < 60; i++) {
@@ -345,7 +359,7 @@ globalThis.addEventListener("unhandledrejection", (e) => {
 // puts the fix where the mistake is, not three resets downstream. A stock
 // postgres.js client — prepare on, as most people have it — must reject, not hang.
 Deno.test("adversarial: a named prepared statement is refused, with the fix in the error", async () => {
-  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   const own = postgres(pg.url, { max: 1, onnotice: () => {} }); // prepare defaults on
   try {
     const e = await assertRejects(() => own`insert into t (v) values (${"a"})`) as postgres.PostgresError;
@@ -363,7 +377,7 @@ Deno.test("adversarial: a named prepared statement is refused, with the fix in t
 // its business — it is ordinary SQL in an unnamed statement. It is session state
 // like any other, so a reset takes it.
 Deno.test("server-side PREPARE is untouched, and does not survive a reset", async () => {
-  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   await pg.sql`prepare ins (text) as insert into t (v) values ($1)`.simple();
   await pg.sql`execute ins ('a')`.simple();
   assertEquals((await pg.sql`select v from t`)[0].v, "a");
@@ -375,7 +389,7 @@ Deno.test("server-side PREPARE is untouched, and does not survive a reset", asyn
 // The unnamed statement is how `prepare: false` talks, and it must stay allowed:
 // same Parse message code, empty name.
 Deno.test("the bundled client never names a statement, across a reset", async () => {
-  await using pg = await pgtemp({ setup: `create table t (a int, b text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (a int, b text)` });
   await pg.sql`insert into t (a, b) values (${1}, ${"x"})`;
   await pg.reset();
   await pg.sql.begin(async (tx) => {
@@ -394,7 +408,7 @@ Deno.test("the bundled client never names a statement, across a reset", async ()
 // statements. Everything below is about those two properties.
 
 Deno.test("a pooled driver runs concurrent queries across connections", async () => {
-  await using pg = await pgtemp({ setup: `create table t (id serial primary key, v int)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (id serial primary key, v int)` });
   const own = postgres(pg.url, { max: 8, prepare: false, onnotice: () => {} });
   try {
     const rows = await Promise.all(
@@ -414,7 +428,7 @@ Deno.test("a pooled driver runs concurrent queries across connections", async ()
 // rollback would take the interleaved connection's rows down with it, and a
 // commit would keep rows that were supposed to vanish.
 Deno.test("adversarial: concurrent transactions do not interleave", async () => {
-  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   const own = postgres(pg.url, { max: 6, prepare: false, onnotice: () => {} });
   try {
     const results = await Promise.allSettled(
@@ -477,7 +491,7 @@ const untilReady = (socket: Socket) =>
   });
 
 Deno.test("adversarial: a client that dies mid-transaction does not strand the backend", async () => {
-  await using pg = await pgtemp({ setup: `create table t (v text)` });
+  await using pg = await pgtemp({ snapshot: base, setup: `create table t (v text)` });
   const socket = connect(pg.port, "127.0.0.1");
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", resolve);
@@ -501,9 +515,7 @@ Deno.test("adversarial: a client that dies mid-transaction does not strand the b
 
 Deno.test("adversarial: bad setup SQL names the offending statement", async () => {
   const e = await assertRejects(() =>
-    pgtemp({
-      setup: [`create table ok (n int)`, `this is not valid sql`],
-    })
+    pgtemp({ snapshot: base, setup: [`create table ok (n int)`, `this is not valid sql`] })
   );
   assertStringIncludes((e as Error).message, "this is not valid sql");
 });
@@ -703,6 +715,7 @@ const contribs: [string, Extension, string, string, unknown][] = [
 
 Deno.test("contrib extensions load together and actually work", async () => {
   await using pg = await pgtemp({
+    snapshot: base,
     extensions: Object.fromEntries(
       contribs.map(([name, ext]) => [name, ext]),
     ) as Extensions,

@@ -67,8 +67,29 @@ Deno.test("cheap isolated case", async () => {
 
 `setup` still runs after `snapshot`, so a shared base composes with per-test extras.
 
-Each boot without a snapshot runs initdb, which makes it about 3x slower. A second one in the same process prints a
-warning with this pattern.
+Each boot without a snapshot runs initdb, which makes it slower. A second one in the same process prints a warning with
+the recipe below.
+
+To keep a snapshot across runs, cache it on disk. The file name hashes `MIGRATIONS` and `deno.lock`, so a new migration
+or a pgtemp upgrade builds a new snapshot. `/tmp` clears old snapshots on its own. A stale snapshot from an older
+Postgres major fails with `PGlite could not boot this snapshot`.
+
+```ts
+const key = new TextEncoder().encode(MIGRATIONS + await Deno.readTextFile("deno.lock"));
+const path = `/tmp/pgtemp/${new Uint8Array(await crypto.subtle.digest("SHA-256", key)).toHex()}.tar`;
+const snapshot = await Deno.readFile(path).then((b) => new Blob([b]), async (e) => {
+  if (!(e instanceof Deno.errors.NotFound)) throw e;
+  await using pg = await pgtemp({ setup: MIGRATIONS });
+  const snap = await pg.snapshot();
+  await Deno.mkdir("/tmp/pgtemp", { recursive: true });
+  const tmp = `${path}.${crypto.randomUUID()}`; // rename: parallel files never read half a file
+  await Deno.writeFile(tmp, snap.stream());
+  await Deno.rename(tmp, path);
+  return snap;
+});
+```
+
+Run tests with `--allow-write=/tmp/pgtemp`.
 
 Within one instance, `reset` swaps the backend without touching the listener, so `url` and `port` stay valid:
 
