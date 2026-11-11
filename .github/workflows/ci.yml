@@ -16,7 +16,7 @@ jobs:
       - run: deno audit
       - run: deno fmt --check
       - run: deno lint
-      - run: deno check mod.ts mod.test.ts
+      - run: deno check mod.ts mod.test.ts status.ts
       - run: deno task test
       - run: deno publish --dry-run --allow-dirty
 

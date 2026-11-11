@@ -37,24 +37,28 @@ import type { Socket } from "node:net";
 import type { Buffer } from "node:buffer";
 import { pgtemp, type Sql } from "./mod.ts";
 
-// This test must stay first in the file. It holds the first boots in the process, so
-// they are the ones that run initdb and cache the fresh cluster. A failed first boot
-// must not poison the cache for the boots after it. Two boots then race, and their
-// setup must not leak into the cache that every later boot loads.
-Deno.test("the cached fresh cluster holds no instance's setup", async () => {
-  const bad: Extension = { name: "bad", setup: () => Promise.reject(new Error("bad extension")) };
-  await assertRejects(() => pgtemp({ extensions: { bad } }), Error, "bad extension");
-  const [a, b] = await Promise.all([
-    pgtemp({ setup: `create table m (v text); insert into m values ('a')` }),
-    pgtemp({ setup: `create table m (v text); insert into m values ('b')` }),
-  ]);
-  await using _a = a;
-  await using _b = b;
-  await using c = await pgtemp();
-  assertEquals([(await a.sql`select v from m`)[0].v, (await b.sql`select v from m`)[0].v], ["a", "b"]);
-  assertEquals((await c.sql`select to_regclass('m') as m`)[0].m, null);
-  await c.reset();
-  assertEquals((await c.sql`select to_regclass('m') as m`)[0].m, null);
+// This test must stay first in the file: the warning fires once per process, at the
+// second boot without a snapshot.
+Deno.test("a second cold boot warns once, with the snapshot fix", async () => {
+  const warn = console.warn;
+  const warned: string[] = [];
+  console.warn = (msg: string) => warned.push(msg);
+  try {
+    const snapshot = await (async () => {
+      await using pg = await pgtemp();
+      return await pg.snapshot();
+    })();
+    assertEquals(warned, []);
+    await using pg = await pgtemp({ snapshot });
+    await pg.reset();
+    assertEquals(warned, []);
+    await (await pgtemp()).close();
+    await (await pgtemp()).close();
+    assertEquals(warned.length, 1);
+    assertStringIncludes(warned[0], "pgtemp({ snapshot })");
+  } finally {
+    console.warn = warn;
+  }
 });
 
 Deno.test("happy path: connect and select 1", async () => {

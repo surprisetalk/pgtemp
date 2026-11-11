@@ -12,6 +12,7 @@
   },
   "tasks": {
     "test": "deno test --allow-net --allow-read --allow-env",
+    "status": "deno run --allow-net --allow-read --allow-env status.ts",
     "hooks": "git config core.hooksPath .githooks"
   },
   "publish": {
@@ -19,6 +20,7 @@
       "todo.md",
       "mod.test.ts",
       "smoke.ts",
+      "status.ts",
       ".github",
       ".githooks"
     ]

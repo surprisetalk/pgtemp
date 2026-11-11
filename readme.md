@@ -67,6 +67,9 @@ Deno.test("cheap isolated case", async () => {
 
 `setup` still runs after `snapshot`, so a shared base composes with per-test extras.
 
+Each boot without a snapshot runs initdb, which makes it about 3x slower. A second one in the same process prints a
+warning with this pattern.
+
 Within one instance, `reset` swaps the backend without touching the listener, so `url` and `port` stay valid:
 
 ```ts
@@ -91,3 +94,8 @@ Two caveats, from the backend swap:
 - Read `pg.sql` and `pg.db` off the object each time. They are getters; a destructured `const { sql } = pg` still points
   at the closed pre-reset client.
 - Session state does not survive a reset, so don't reset mid-transaction.
+
+## Status
+
+`deno task status` checks that JSR serves the version in `deno.json`, that CI passed on main, and that both kinds of
+boot stay fast. snitch runs it every hour.

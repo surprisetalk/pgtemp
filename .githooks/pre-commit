@@ -11,7 +11,7 @@ jj file list 'glob:**/*.sh' | xargs shellcheck -x -P SCRIPTDIR .githooks/pre-com
 timeout 30 deno audit
 deno fmt --check || { printf '\n  fix with: deno fmt\n\n'; exit 1; }
 deno lint
-deno check mod.ts mod.test.ts
+deno check mod.ts mod.test.ts status.ts
 deno task test
 # jj leaves the change in @, so git always sees a dirty tree.
 deno publish --dry-run --allow-dirty
