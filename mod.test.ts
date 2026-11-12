@@ -73,6 +73,13 @@ Deno.test("a second cold boot warns once, with the snapshot fix", async () => {
   }
 });
 
+Deno.test("boots and resets run with 16MB of shared_buffers", async () => {
+  await using pg = await pgtemp({ snapshot: base });
+  assertEquals((await pg.sql`show shared_buffers`)[0].shared_buffers, "16MB");
+  await pg.reset();
+  assertEquals((await pg.sql`show shared_buffers`)[0].shared_buffers, "16MB");
+});
+
 Deno.test("happy path: connect and select 1", async () => {
   await using pg = await pgtemp({ snapshot: base });
   const [row] = await pg.sql`select 1 as n`;

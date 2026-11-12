@@ -301,6 +301,12 @@ export const pgtemp = async (opts: PgtempOpts = {}): Promise<Pgtemp> => {
     const next = new PGlite({
       extensions: opts.extensions,
       loadDataDir: snap,
+      // REVIEW: 16MB of shared_buffers, not PGlite's 160MB. PGlite 0.5 (Postgres 18) grew
+      // an instance from about 200 to 315 MiB. 16MB brings 8 instances from 2950 to 2150
+      // MiB, and vixing's suite at 4 jobs from 3.10 to 2.72 GB. The data dir lives in
+      // memory, so a buffer miss costs a copy, not a disk read. Alternative: PGlite's
+      // default. It costs no code, but each instance holds about 100 MiB more.
+      postgresqlconf: "shared_buffers = 16MB",
     });
     try {
       // PGlite says only "failed to initialize properly" when a data dir comes from
