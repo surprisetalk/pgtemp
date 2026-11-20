@@ -119,4 +119,4 @@ Two caveats, from the backend swap:
 ## Status
 
 `deno task status` checks that JSR serves the version in `deno.json`, that CI passed on main, and that both kinds of
-boot stay fast. snitch runs it every hour.
+boot stay fast. snitch runs it every hour. Only the Mac times boots, because the limits fit an M-series Mac.

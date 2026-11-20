@@ -45,22 +45,33 @@ const fastest = async (boot: () => Promise<{ close: () => Promise<void> }>) => {
   }
   return Math.min(...ms);
 };
-const snapshot = await (async () => {
-  await using pg = await pgtemp();
-  return await pg.snapshot();
-})();
-const warm = await fastest(() => pgtemp({ snapshot }));
-// 1000ms and 300ms are ~3x the cold and snapshot boots on an idle M-series Mac.
-// Condition names stay fixed, because snitch tracks each one's streak by name.
-const cold = await fastest(() => pgtemp());
+// REVIEW: Time boots on the Mac only. pc's Ryzen 3700X boots ~3x slower than an M4 Pro in CPU time too, so its load is
+// not the cause. Alternative: a second pair of limits for pc. It keeps a regression net there, but each host then
+// needs its own calibration.
+const boots = Deno.build.os === "darwin"
+  ? await (async () => {
+    const snapshot = await (async () => {
+      await using pg = await pgtemp();
+      return await pg.snapshot();
+    })();
+    return { warm: await fastest(() => pgtemp({ snapshot })), cold: await fastest(() => pgtemp()) };
+  })()
+  : undefined;
 console.log(
-  `deno.json ${version}, JSR ${latest}, CI ${conclusion}, boot ${warm.toFixed(0)}ms warm, ${cold.toFixed(0)}ms cold`,
+  `deno.json ${version}, JSR ${latest}, CI ${conclusion}, ` +
+    (boots
+      ? `boot ${boots.warm.toFixed(0)}ms warm, ${boots.cold.toFixed(0)}ms cold`
+      : `boot check runs on the Mac only (status.ts)`),
 );
 const conditions = {
   "JSR serves the version in deno.json.": { "0": latest === version ? 1 : 0 },
   "CI passed on the latest finished run on main.": { "0": conclusion === "success" ? 1 : 0 },
-  "A pgtemp() from a snapshot boots in 300ms.": { "0": 300 / warm },
-  "A pgtemp() with no snapshot boots in 1000ms.": { "0": 1000 / cold },
+  // 1000ms and 300ms are ~3x the cold and snapshot boots on an idle M-series Mac.
+  // Condition names stay fixed, because snitch tracks each one's streak by name.
+  ...boots && {
+    "A pgtemp() from a snapshot boots in 300ms.": { "0": 300 / boots.warm },
+    "A pgtemp() with no snapshot boots in 1000ms.": { "0": 1000 / boots.cold },
+  },
 };
 console.log(JSON.stringify(conditions, null, 1));
 if (Object.values(conditions).some((c) => c["0"] < 1)) Deno.exit(1);
